@@ -18,12 +18,13 @@ import docker
 import telebot
 from apscheduler.schedulers.background import BackgroundScheduler
 from docker.errors import NotFound
-from flask import Flask, abort, jsonify, request, send_file
+from flask import Flask, abort, jsonify, request, send_file, send_from_directory
 from git import Repo
 from dotenv import load_dotenv
 from telebot.apihelper import ApiTelegramException
 from telebot import types
 from waitress import serve
+from urllib.parse import urlsplit
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -31,13 +32,14 @@ PROJECTS_DIR = Path(os.getenv("PROJECTS_ROOT", str(BASE_DIR / "projects"))).reso
 DATA_DIR = Path(os.getenv("DATA_DIR", str(BASE_DIR / "data"))).resolve()
 DB_PATH = Path(os.getenv("SQLITE_PATH", str(DATA_DIR / "ozod.sqlite"))).resolve()
 API_PORT = int(os.getenv("PORT", os.getenv("API_PORT", "8000")))
-BOT_TOKEN = os.getenv("BOT_TOKEN", "8787937843:AAFrpXDJW0Vw9tRxlaZEMXBKYqmhc6RRy7E").strip()
+BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 API_TOKEN = os.getenv("API_TOKEN", "").strip()
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "https://ozodhosting.onrender.com").rstrip("/")
 PROJECT_LIMIT = int(os.getenv("PROJECT_LIMIT_PER_USER", "2"))
 DEPLOYMENT_TIMEOUT_SEC = max(int(os.getenv("DEPLOYMENT_TIMEOUT_MS", "600000")) // 1000, 60)
 GITHUB_POLL_MINUTES = max(int(os.getenv("GITHUB_POLL_MINUTES", "10")), 1)
 LIST_PAGE_SIZE = 5
+LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0"}
 
 STATUS_PENDING = "pending"
 STATUS_BUILDING = "building"
@@ -68,6 +70,26 @@ local_processes = {}
 
 def now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+
+
+def public_base_url() -> str:
+    base = (PUBLIC_BASE_URL or "").rstrip("/")
+    if not base:
+        return f"http://127.0.0.1:{API_PORT}"
+    parsed = urlsplit(base)
+    if parsed.scheme in {"http", "https"} and parsed.hostname in LOCAL_HOSTS and parsed.port is None:
+        return f"{parsed.scheme}://{parsed.hostname}:{API_PORT}"
+    return base
+
+
+def public_host_base() -> str:
+    base = (PUBLIC_BASE_URL or "").rstrip("/")
+    if not base:
+        return "http://127.0.0.1"
+    parsed = urlsplit(base)
+    if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+        return "http://127.0.0.1"
+    return f"{parsed.scheme}://{parsed.hostname}"
 
 
 def log(message: str) -> None:
@@ -247,6 +269,11 @@ def get_project(project_id: int):
         return row_to_dict(conn.execute("SELECT * FROM projects WHERE id = ?", (project_id,)).fetchone())
 
 
+def get_project_by_slug(slug: str):
+    with db() as conn:
+        return row_to_dict(conn.execute("SELECT * FROM projects WHERE slug = ?", (slug,)).fetchone())
+
+
 def get_latest_deployment(project_id: int):
     with db() as conn:
         return row_to_dict(
@@ -386,6 +413,23 @@ def project_log_path(project: dict) -> Path:
     return project_dir(project) / "runtime.log"
 
 
+def project_static_dir(project: dict) -> Optional[Path]:
+    work_dir = (project.get("work_dir") or "").strip()
+    output_dir = (project.get("output_dir") or "").strip()
+    if not work_dir or not output_dir:
+        return None
+    target = (Path(work_dir) / output_dir).resolve()
+    try:
+        target.relative_to(Path(work_dir).resolve())
+    except ValueError:
+        return None
+    return target if target.exists() and target.is_dir() else None
+
+
+def project_static_url(project: dict) -> str:
+    return f"{public_base_url()}/site/{project['slug']}/"
+
+
 def safe_remove_dir(path: Path) -> None:
     if path.exists():
         shutil.rmtree(path, ignore_errors=True)
@@ -394,13 +438,21 @@ def safe_remove_dir(path: Path) -> None:
 def detect_runtime(source_dir: Path, project: dict) -> dict:
     package_json = source_dir / "package.json"
     requirements_txt = source_dir / "requirements.txt"
+    index_html = source_dir / "index.html"
 
     if package_json.exists():
         package = json.loads(package_json.read_text("utf-8"))
         deps = {**package.get("dependencies", {}), **package.get("devDependencies", {})}
         build_command = project["build_command"] or package.get("scripts", {}).get("build", "")
-        is_static = bool(build_command and any(dep in deps for dep in ("react", "vite", "next")))
+        scripts = package.get("scripts", {})
         output_dir = "dist" if "vite" in deps else ".next" if "next" in deps else "build"
+        is_static = bool(
+            build_command
+            and (
+                any(dep in deps for dep in ("react", "vite", "next", "vue", "svelte", "@angular/core"))
+                or "build" in scripts
+            )
+        )
         return {
             "project_kind": "node",
             "runtime": "node:22-bookworm-slim",
@@ -418,10 +470,21 @@ def detect_runtime(source_dir: Path, project: dict) -> dict:
             "output_dir": "",
         }
 
+    if index_html.exists():
+        return {
+            "project_kind": "static",
+            "runtime": "",
+            "build_command": project["build_command"] or "",
+            "is_static": 1,
+            "output_dir": ".",
+        }
+
     raise RuntimeError("Unsupported project type. package.json yoki requirements.txt bo'lishi kerak.")
 
 
 def write_dockerfile(source_dir: Path, project: dict, runtime: dict) -> None:
+    if runtime["project_kind"] == "static":
+        return
     if runtime["project_kind"] == "node":
         lines = [
             f"FROM {runtime['runtime']}",
@@ -522,7 +585,11 @@ def prepare_source(project: dict) -> tuple[Path, str]:
 
 
 def build_static(source_dir: Path, runtime: dict, slug: str) -> str:
-    if not runtime["is_static"] or not runtime["build_command"]:
+    if not runtime["is_static"]:
+        return ""
+    if runtime["project_kind"] == "static":
+        return f"{public_base_url()}/site/{slug}/"
+    if not runtime["build_command"]:
         return ""
     subprocess.run(
         [
@@ -541,7 +608,28 @@ def build_static(source_dir: Path, runtime: dict, slug: str) -> str:
         check=True,
         timeout=DEPLOYMENT_TIMEOUT_SEC,
     )
-    return f"{PUBLIC_BASE_URL}/projects/{slug}/{runtime['output_dir']}/"
+    return f"{public_base_url()}/site/{slug}/"
+
+
+def build_static_local(source_dir: Path, runtime: dict, slug: str) -> str:
+    if not runtime["is_static"]:
+        return ""
+    if runtime["project_kind"] == "static":
+        return f"{public_base_url()}/site/{slug}/"
+    if not runtime["build_command"]:
+        return ""
+    creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
+    subprocess.run(
+        ["cmd", "/c", f"npm install && {runtime['build_command']}"],
+        cwd=str(source_dir),
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        stdin=subprocess.DEVNULL,
+        check=True,
+        timeout=DEPLOYMENT_TIMEOUT_SEC,
+        creationflags=creationflags,
+    )
+    return f"{public_base_url()}/site/{slug}/"
 
 
 def start_local_process(project: dict, source_dir: Path) -> tuple[str, str, str]:
@@ -666,7 +754,7 @@ def run_container(project: dict, image_tag: str) -> tuple[str, str, str]:
     binding = container.attrs["NetworkSettings"]["Ports"].get("3000/tcp") or []
     host_port = binding[0]["HostPort"] if binding else ""
     logs = container.logs(stdout=True, stderr=True, tail=200).decode("utf-8", errors="ignore")[-12000:]
-    return container.id, f"{PUBLIC_BASE_URL}:{host_port}" if host_port else "", logs
+    return container.id, f"{public_host_base()}:{host_port}" if host_port else "", logs
 
 
 def deploy_project(project_id: int, deployment_id: int) -> None:
@@ -681,17 +769,22 @@ def deploy_project(project_id: int, deployment_id: int) -> None:
         source_dir, commit_hash = prepare_source(project)
         runtime = detect_runtime(source_dir, project)
         write_project_env(source_dir, project)
-        write_dockerfile(source_dir, project, runtime)
         remove_container(project["container_id"] or "")
         stop_local_process(project)
 
-        if docker_is_available():
+        if runtime["project_kind"] == "static":
+            write_dockerfile(source_dir, project, runtime)
+            static_url = build_static_local(source_dir, runtime, project["slug"])
+            container_id, runtime_url, logs = "static", "", "Static site ready"
+        elif docker_is_available():
+            write_dockerfile(source_dir, project, runtime)
             static_url = build_static(source_dir, runtime, project["slug"])
             image_tag = f"ozod/{project['slug']}:latest"
             get_docker_client().images.build(path=str(source_dir), tag=image_tag, rm=True)
             container_id, runtime_url, logs = run_container(project, image_tag)
         else:
-            static_url = ""
+            write_dockerfile(source_dir, project, runtime)
+            static_url = build_static_local(source_dir, runtime, project["slug"])
             container_id, runtime_url, logs = start_local_process(project, source_dir)
 
         update_project(
@@ -727,6 +820,15 @@ def control_project(project_id: int, action: str) -> None:
         safe_remove_dir(project_dir(project))
         update_project(project_id, status=STATUS_DELETED, container_id="", public_url="", work_dir="")
         return
+
+    if project.get("is_static") and (project.get("container_id") or "") == "static":
+        if action in {"pause", "stop"}:
+            update_project(project_id, status=STATUS_PAUSED if action == "pause" else STATUS_STOPPED, public_url="")
+            return
+        if action in {"start", "restart"}:
+            update_project(project_id, status=STATUS_RUNNING, public_url=project_static_url(project), last_log="Static site ready")
+            return
+        raise RuntimeError("Unsupported action")
 
     if not project["container_id"]:
         raise RuntimeError("Container not found")
@@ -881,7 +983,7 @@ def github_poll() -> None:
 
 
 def api_auth() -> None:
-    if request.path in {"/", "/health", "/favicon.ico"}:
+    if request.path in {"/", "/health", "/favicon.ico"} or request.path.startswith("/site/"):
         return
     token = request.headers.get("Authorization", "").replace("Bearer ", "").strip()
     if not API_TOKEN or token != API_TOKEN:
@@ -911,6 +1013,28 @@ def api_favicon():
 @app.get("/health")
 def api_health():
     return jsonify({"ok": True, "bot": bool(BOT_TOKEN)})
+
+
+@app.get("/site/<slug>/")
+@app.get("/site/<slug>/<path:asset_path>")
+def serve_project_site(slug: str, asset_path: str = "index.html"):
+    project = get_project_by_slug(slug)
+    if not project or not project.get("is_static"):
+        abort(404)
+    static_dir = project_static_dir(project)
+    if not static_dir:
+        abort(404)
+    target = (static_dir / asset_path).resolve()
+    try:
+        target.relative_to(static_dir)
+    except ValueError:
+        abort(404)
+    if target.exists() and target.is_file():
+        return send_from_directory(static_dir, asset_path)
+    index_path = static_dir / "index.html"
+    if index_path.exists():
+        return send_from_directory(static_dir, "index.html")
+    abort(404)
 
 
 @app.post("/users/sync")
