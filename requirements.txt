@@ -1,0 +1,7 @@
+Flask==3.1.1
+pyTelegramBotAPI==4.27.0
+docker==7.1.0
+GitPython==3.1.43
+APScheduler==3.10.4
+python-dotenv==1.0.1
+waitress==3.0.0
