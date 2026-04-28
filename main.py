@@ -39,6 +39,7 @@ PROJECT_LIMIT = int(os.getenv("PROJECT_LIMIT_PER_USER", "2"))
 DEPLOYMENT_TIMEOUT_SEC = max(int(os.getenv("DEPLOYMENT_TIMEOUT_MS", "600000")) // 1000, 60)
 GITHUB_POLL_MINUTES = max(int(os.getenv("GITHUB_POLL_MINUTES", "10")), 1)
 LIST_PAGE_SIZE = 5
+ENABLE_DOCKER = os.getenv("ENABLE_DOCKER", "").strip().lower() in {"1", "true", "yes", "on"}
 LOCAL_HOSTS = {"localhost", "127.0.0.1", "0.0.0.0"}
 
 STATUS_PENDING = "pending"
@@ -140,6 +141,8 @@ def get_docker_client() -> docker.DockerClient:
 
 
 def docker_is_available() -> bool:
+    if not ENABLE_DOCKER:
+        return False
     try:
         get_docker_client()
         return True
@@ -620,8 +623,9 @@ def build_static_local(source_dir: Path, runtime: dict, slug: str) -> str:
         return ""
     creationflags = getattr(subprocess, "CREATE_NO_WINDOW", 0)
     subprocess.run(
-        ["cmd", "/c", f"npm install && {runtime['build_command']}"],
+        f"npm install && {runtime['build_command']}",
         cwd=str(source_dir),
+        shell=True,
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         stdin=subprocess.DEVNULL,
@@ -680,6 +684,35 @@ def start_local_process(project: dict, source_dir: Path) -> tuple[str, str, str]
             creationflags=creationflags,
         )
 
+    package_json_path = source_dir / "package.json"
+    if package_json_path.exists():
+        npm_install_command = "npm ci" if (source_dir / "package-lock.json").exists() else "npm install"
+        subprocess.run(
+            npm_install_command,
+            cwd=str(source_dir),
+            env=child_env,
+            shell=True,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL,
+            check=False,
+            timeout=DEPLOYMENT_TIMEOUT_SEC,
+            creationflags=creationflags,
+        )
+        if project.get("build_command"):
+            subprocess.run(
+                project["build_command"],
+                cwd=str(source_dir),
+                env=child_env,
+                shell=True,
+                stdout=log_file,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                check=False,
+                timeout=DEPLOYMENT_TIMEOUT_SEC,
+                creationflags=creationflags,
+            )
+
     process = subprocess.Popen(
         project["start_command"],
         cwd=str(source_dir),
@@ -707,13 +740,21 @@ def stop_local_process(project: dict) -> None:
     if container_id.startswith("local:"):
         try:
             pid = int(container_id.split(":", 1)[1])
-            subprocess.run(
-                ["taskkill", "/PID", str(pid), "/T", "/F"],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-                creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
-            )
+            if os.name == "nt":
+                subprocess.run(
+                    ["taskkill", "/PID", str(pid), "/T", "/F"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                    creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                )
+            else:
+                subprocess.run(
+                    ["kill", "-TERM", str(pid)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    check=False,
+                )
         except Exception:
             pass
 
@@ -721,7 +762,7 @@ def stop_local_process(project: dict) -> None:
 def remove_container(container_id: str) -> None:
     if not container_id:
         return
-    if container_id.startswith("local:"):
+    if container_id == "static" or container_id.startswith("local:"):
         return
     try:
         get_docker_client().containers.get(container_id).remove(force=True)
@@ -980,6 +1021,35 @@ def github_poll() -> None:
                 update_deployment(deployment["id"], job_id=job_id)
         except Exception as exc:
             log(f"github poll skipped: {exc}")
+
+
+def resume_projects() -> None:
+    with db() as conn:
+        rows = conn.execute(
+            """
+            SELECT * FROM projects
+            WHERE status IN (?, ?) AND status != ? AND work_dir != ''
+            ORDER BY id ASC
+            """,
+            (STATUS_RUNNING, STATUS_PAUSED, STATUS_DELETED),
+        ).fetchall()
+    for row in rows:
+        project = row_to_dict(row)
+        try:
+            if project.get("is_static"):
+                if project["status"] == STATUS_RUNNING:
+                    update_project(project["id"], public_url=project_static_url(project), last_log="Static site ready")
+                continue
+            if project["status"] != STATUS_RUNNING:
+                continue
+            work_dir = Path(project.get("work_dir") or "")
+            if not work_dir.exists():
+                update_project(project["id"], status=STATUS_FAILED, last_log="Work directory topilmadi.")
+                continue
+            container_id, runtime_url, logs = start_local_process(project, work_dir)
+            update_project(project["id"], container_id=container_id, public_url=runtime_url, last_log=logs)
+        except Exception as exc:
+            update_project(project["id"], status=STATUS_FAILED, last_log=f"Auto resume failed: {exc}")
 
 
 def api_auth() -> None:
@@ -1627,6 +1697,7 @@ def run_bot():
 def main():
     init_db()
     threading.Thread(target=worker_loop, daemon=True).start()
+    resume_projects()
 
     scheduler = BackgroundScheduler(timezone="UTC")
     scheduler.add_job(github_poll, "interval", minutes=GITHUB_POLL_MINUTES, max_instances=1)

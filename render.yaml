@@ -2,13 +2,9 @@ services:
   - type: web
     name: ozod-hosting
     runtime: docker
-    plan: starter
+    plan: free
     autoDeploy: true
     healthCheckPath: /health
-    disk:
-      name: ozod-data
-      mountPath: /data
-      sizeGB: 1
     envVars:
       - key: PORT
         value: "10000"
@@ -19,14 +15,16 @@ services:
       - key: API_TOKEN
         sync: false
       - key: PROJECTS_ROOT
-        value: /data/projects
+        value: /tmp/ozod-projects
       - key: DATA_DIR
-        value: /data
+        value: /tmp/ozod-data
       - key: SQLITE_PATH
-        value: /data/ozod.sqlite
+        value: /tmp/ozod-data/ozod.sqlite
       - key: DEPLOYMENT_TIMEOUT_MS
         value: "600000"
       - key: PROJECT_LIMIT_PER_USER
         value: "0"
       - key: GITHUB_POLL_MINUTES
         value: "10"
+      - key: ENABLE_DOCKER
+        value: "false"
